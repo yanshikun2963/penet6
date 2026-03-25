@@ -104,10 +104,12 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # Temperature annealing: start with soft predictions, gradually sharpen
+        ##### Temperature Annealing: gradually sharpen predictions during training
         self.register_buffer('anneal_step', torch.zeros(1))
-        self.anneal_warmup_iters = 8000  # iterations to reach full temperature
-        self.anneal_start_factor = 0.5   # start at 50% of learned temperature
+        self.anneal_total_iters = 50000.0  # total training iterations
+        self.anneal_start_factor = 0.3  # start at 30% of learned temperature
+        # Temperature multiplier goes from anneal_start_factor to 1.0 via cosine schedule
+        #####
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -205,14 +207,16 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        # Temperature annealing: softer predictions early, sharper later
+        ##### Temperature Annealing
         if self.training:
             self.anneal_step += 1
-            progress = min(self.anneal_step.item() / self.anneal_warmup_iters, 1.0)
-            anneal_factor = self.anneal_start_factor + (1.0 - self.anneal_start_factor) * progress
+            progress = min(self.anneal_step.item() / self.anneal_total_iters, 1.0)
+            # Cosine annealing: start_factor -> 1.0
+            anneal_factor = self.anneal_start_factor + (1.0 - self.anneal_start_factor) * 0.5 * (1.0 - np.cos(np.pi * progress))
             effective_scale = self.logit_scale.exp() * anneal_factor
         else:
             effective_scale = self.logit_scale.exp()
+        #####
         rel_dists = rel_rep_norm @ predicate_proto_norm.t() * effective_scale  #  <r_norm, c_norm> / τ(t)
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
