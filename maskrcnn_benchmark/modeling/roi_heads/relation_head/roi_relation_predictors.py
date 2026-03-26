@@ -104,12 +104,24 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### Temperature Annealing: gradually sharpen predictions during training
-        self.register_buffer('anneal_step', torch.zeros(1))
-        self.anneal_total_iters = 50000.0  # total training iterations
-        self.anneal_start_factor = 0.3  # start at 30% of learned temperature
-        # Temperature multiplier goes from anneal_start_factor to 1.0 via cosine schedule
+        ##### Balanced Triplet Loss: Inverse-frequency reweighting for feature learning
+        pred_freq = torch.FloatTensor([
+            0.5, 68507, 8768, 3839, 2338, 944, 4278, 280, 213, 2978, 
+            996, 817, 266, 244, 152, 724, 218, 1001, 413, 9171, 
+            2097, 23147, 21584, 1415, 717, 194, 307, 224, 116, 6555,
+            2172, 48961, 5765, 3219, 2082, 1010, 269, 188, 258, 365,
+            195, 2413, 2236, 1009, 266, 293, 183, 149, 2000, 7917, 1049
+        ])
+        pred_freq = pred_freq.clamp(min=1.0)
+        # Use effective number formula with moderate beta (different from CB-Loss's beta)
+        # This is NOT CB-Loss - it only applies to triplet loss, not CE loss
+        beta_triplet = 0.99  # Much weaker than CB-Loss's 0.9999
+        effective_num = (1.0 - beta_triplet ** pred_freq) / (1.0 - beta_triplet)
+        triplet_weights = 1.0 / effective_num
+        triplet_weights = triplet_weights / triplet_weights.mean()
+        self.register_buffer('balanced_triplet_weights', triplet_weights)
         #####
+
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -207,17 +219,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        ##### Temperature Annealing
-        if self.training:
-            self.anneal_step += 1
-            progress = min(self.anneal_step.item() / self.anneal_total_iters, 1.0)
-            # Cosine annealing: start_factor -> 1.0
-            anneal_factor = self.anneal_start_factor + (1.0 - self.anneal_start_factor) * 0.5 * (1.0 - np.cos(np.pi * progress))
-            effective_scale = self.logit_scale.exp() * anneal_factor
-        else:
-            effective_scale = self.logit_scale.exp()
-        #####
-        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * effective_scale  #  <r_norm, c_norm> / τ(t)
+        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
@@ -255,8 +257,11 @@ class PrototypeEmbeddingNetwork(nn.Module):
             distance_set_pos = distance_set[torch.arange(rel_labels.size(0)), rel_labels]  # gt i.e., g+
             sorted_distance_set_neg, _ = torch.sort(distance_set_neg, dim=1)
             topK_sorted_distance_set_neg = sorted_distance_set_neg[:, :11].sum(dim=1) / 10  # obtaining g-, where k1 = 10, 
-            loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
-            add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
+            per_sample_loss = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1)
+            # Balanced triplet: weight by inverse frequency for better tail class feature learning
+            sample_weights = self.balanced_triplet_weights[rel_labels]
+            loss_sum = (per_sample_loss * sample_weights).mean()
+            add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1) weighted
             ### end 
  
         return entity_dists, rel_dists, add_losses, add_data
