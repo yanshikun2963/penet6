@@ -104,17 +104,18 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### Component 2: Balanced Sampling + Tail Feature Augmentation
+        ##### Component 2: Balanced Prototype Contrastive Loss
+        # Prototype-anchored contrastive loss with inverse-frequency weighting
+        # Replaces the fixed triplet loss with a frequency-balanced version
         pred_freq = torch.FloatTensor([0.5, 68507, 8768, 3839, 2338, 944, 4278, 280, 213, 2978,
             996, 817, 266, 244, 152, 724, 218, 1001, 413, 9171,
             2097, 23147, 21584, 1415, 717, 194, 307, 224, 116, 6555,
             2172, 48961, 5765, 3219, 2082, 1010, 269, 188, 258, 365,
             195, 2413, 2236, 1009, 266, 293, 183, 149, 2000, 7917, 1049]).clamp(min=1.0)
-        inv_sqrt_freq = 1.0 / torch.sqrt(pred_freq)
-        self.register_buffer('balanced_weights', inv_sqrt_freq / inv_sqrt_freq.mean())
-        median_freq = pred_freq.median()
-        self.register_buffer('is_tail_class', (pred_freq < median_freq).float())
-        self.aug_noise_scale = 0.1
+        inv_freq = 1.0 / pred_freq
+        self.register_buffer('balanced_weights', inv_freq / inv_freq.mean())
+        self.contrastive_temp = 0.1  # temperature for contrastive loss
+        self.contrastive_weight = 0.5  # weight of contrastive loss
         #####
 
         ##### refine object labels
@@ -213,7 +214,9 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
+        ### Component 2: Balanced Contrastive - standard logit computation
+        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
+        ###
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
@@ -251,23 +254,31 @@ class PrototypeEmbeddingNetwork(nn.Module):
             distance_set_pos = distance_set[torch.arange(rel_labels.size(0)), rel_labels]  # gt i.e., g+
             sorted_distance_set_neg, _ = torch.sort(distance_set_neg, dim=1)
             topK_sorted_distance_set_neg = sorted_distance_set_neg[:, :11].sum(dim=1) / 10  # obtaining g-, where k1 = 10, 
-            per_sample_loss = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1)
-            sample_weights = self.balanced_weights[rel_labels]
-            loss_sum = (per_sample_loss * sample_weights).mean()
+            loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
 
  
-            # Tail feature augmentation
-            if self.aug_noise_scale > 0:
-                tail_mask = self.is_tail_class[rel_labels]
-                if tail_mask.sum() > 0:
-                    noise = torch.randn_like(rel_rep) * self.aug_noise_scale
-                    aug_rep = rel_rep + noise * tail_mask.unsqueeze(1)
-                    aug_rep_norm = aug_rep / aug_rep.norm(dim=1, keepdim=True)
-                    aug_dists = aug_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
-                    aug_loss = F.cross_entropy(aug_dists, rel_labels.long()) * 0.3
-                    add_losses.update({"aug_loss": aug_loss})
+
+            ### Component 2: Balanced Prototype Contrastive Loss
+            # Compute cosine similarity between features and all prototypes
+            sim_matrix = rel_rep_norm @ predicate_proto_norm.t() / self.contrastive_temp  # (N, 51)
+            # Create positive mask
+            pos_mask = torch.zeros_like(sim_matrix)
+            pos_mask[torch.arange(rel_labels.size(0)), rel_labels] = 1.0
+            # Log-sum-exp trick for numerical stability
+            logits_max, _ = sim_matrix.max(dim=1, keepdim=True)
+            sim_matrix_stable = sim_matrix - logits_max.detach()
+            exp_sim = torch.exp(sim_matrix_stable)
+            log_sum_exp = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+            log_prob = sim_matrix_stable - log_sum_exp
+            # Per-sample contrastive loss weighted by class frequency
+            per_sample_loss = -(pos_mask * log_prob).sum(dim=1)
+            sample_weights = self.balanced_weights[rel_labels]
+            balanced_contrastive = (per_sample_loss * sample_weights).mean()
+            add_losses.update({"balanced_contrastive": balanced_contrastive * self.contrastive_weight})
+            ###
+
  
         return entity_dists, rel_dists, add_losses, add_data
 
