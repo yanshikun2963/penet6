@@ -104,24 +104,18 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### Balanced Triplet Loss: Inverse-frequency reweighting for feature learning
-        pred_freq = torch.FloatTensor([
-            0.5, 68507, 8768, 3839, 2338, 944, 4278, 280, 213, 2978, 
-            996, 817, 266, 244, 152, 724, 218, 1001, 413, 9171, 
+        ##### Component 2: Balanced Sampling + Tail Feature Augmentation
+        pred_freq = torch.FloatTensor([0.5, 68507, 8768, 3839, 2338, 944, 4278, 280, 213, 2978,
+            996, 817, 266, 244, 152, 724, 218, 1001, 413, 9171,
             2097, 23147, 21584, 1415, 717, 194, 307, 224, 116, 6555,
             2172, 48961, 5765, 3219, 2082, 1010, 269, 188, 258, 365,
-            195, 2413, 2236, 1009, 266, 293, 183, 149, 2000, 7917, 1049
-        ])
-        pred_freq = pred_freq.clamp(min=1.0)
-        # Use effective number formula with moderate beta (different from CB-Loss's beta)
-        # This is NOT CB-Loss - it only applies to triplet loss, not CE loss
-        beta_triplet = 0.99  # Much weaker than CB-Loss's 0.9999
-        effective_num = (1.0 - beta_triplet ** pred_freq) / (1.0 - beta_triplet)
-        triplet_weights = 1.0 / effective_num
-        triplet_weights = triplet_weights / triplet_weights.mean()
-        self.register_buffer('balanced_triplet_weights', triplet_weights)
+            195, 2413, 2236, 1009, 266, 293, 183, 149, 2000, 7917, 1049]).clamp(min=1.0)
+        inv_sqrt_freq = 1.0 / torch.sqrt(pred_freq)
+        self.register_buffer('balanced_weights', inv_sqrt_freq / inv_sqrt_freq.mean())
+        median_freq = pred_freq.median()
+        self.register_buffer('is_tail_class', (pred_freq < median_freq).float())
+        self.aug_noise_scale = 0.1
         #####
-
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -258,11 +252,22 @@ class PrototypeEmbeddingNetwork(nn.Module):
             sorted_distance_set_neg, _ = torch.sort(distance_set_neg, dim=1)
             topK_sorted_distance_set_neg = sorted_distance_set_neg[:, :11].sum(dim=1) / 10  # obtaining g-, where k1 = 10, 
             per_sample_loss = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1)
-            # Balanced triplet: weight by inverse frequency for better tail class feature learning
-            sample_weights = self.balanced_triplet_weights[rel_labels]
+            sample_weights = self.balanced_weights[rel_labels]
             loss_sum = (per_sample_loss * sample_weights).mean()
-            add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1) weighted
+            add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
+
+ 
+            # Tail feature augmentation
+            if self.aug_noise_scale > 0:
+                tail_mask = self.is_tail_class[rel_labels]
+                if tail_mask.sum() > 0:
+                    noise = torch.randn_like(rel_rep) * self.aug_noise_scale
+                    aug_rep = rel_rep + noise * tail_mask.unsqueeze(1)
+                    aug_rep_norm = aug_rep / aug_rep.norm(dim=1, keepdim=True)
+                    aug_dists = aug_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
+                    aug_loss = F.cross_entropy(aug_dists, rel_labels.long()) * 0.3
+                    add_losses.update({"aug_loss": aug_loss})
  
         return entity_dists, rel_dists, add_losses, add_data
 
